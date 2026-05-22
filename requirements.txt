@@ -1,0 +1,16 @@
+--extra-index-url https://download.pytorch.org/whl/cu123
+torch==2.4.0
+torchvision==0.19.0
+transformers==4.31.0
+peft==0.4.0
+einops==0.4.1
+numpy==1.26.0
+bitsandbytes==0.41.1
+scikit-image==0.24.0
+scipy==1.11.2
+opencv-python==4.8.0.74
+matplotlib==3.9.2
+deepspeed==0.15.1
+tensorboard==2.19.0
+pycocotools==2.0.10
+sentencepiece==0.2.0
