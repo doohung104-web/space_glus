@@ -11,7 +11,8 @@ import torch.nn.functional as F
 from transformers import BitsAndBytesConfig, CLIPVisionModel
 
 from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
-                         DEFAULT_IMAGE_PATCH_TOKEN, dict_to_cuda)
+                         DEFAULT_IMAGE_PATCH_TOKEN, IMAGE_TOKEN_INDEX,
+                         dict_to_cuda)
 from utils.trajectory_utils import DEFAULT_HISTORY_LEN, STATE_DIM
 
 from .llava.model.language_model.llava_llama import (LlavaLlamaForCausalLM,
@@ -814,20 +815,54 @@ class GLUSForCausalLM(LlavaLlamaForCausalLM):
         
             _seg_token_mask = torch.zeros((seg_token_mask.shape[0], per_batch_mask_length)).bool().cuda()
             
+            # Identify question-portion IMAGE_TOKEN_INDEX positions in the
+            # text part of seg_token_mask.  We expand at these positions
+            # (rather than at [SEG]) so that the mapping stays correct even
+            # when the LLM fails to generate [SEG].
+            text_start_offset = context_frame_num * image_features_num
+            # output_ids[:, 1:] is the text portion; find IMAGE_TOKEN positions
+            _img_positions_in_text = (output_ids[0, 1:] == IMAGE_TOKEN_INDEX).nonzero(as_tuple=True)[0]
+            # Skip the first context_frame_num image tokens (already handled
+            # by the prepended zeros in seg_token_mask).
+            _question_img_set = set()
+            if _img_positions_in_text.numel() > context_frame_num:
+                _question_img_set = set(
+                    _img_positions_in_text[context_frame_num:].tolist()
+                )
+            
             for i in range(seg_token_mask.shape[0]):
-                curr_seg_token_mask = seg_token_mask[i]
                 col_idx = 0
                 for j in range(seg_token_mask.shape[1]):
+                    # Check if this position in the text portion corresponds
+                    # to a question-frame IMAGE_TOKEN_INDEX.  If so, advance
+                    # col_idx by image_features_num to account for the visual
+                    # feature expansion in the hidden state.
+                    text_pos = j - text_start_offset
+                    if text_pos >= 0 and text_pos in _question_img_set:
+                        col_idx += image_features_num
                     if seg_token_mask[i, j] == 1:
                         num_add_mask += 1
-                        col_idx += image_features_num
                         _seg_token_mask[i, col_idx] = 1
                     else:
                         _seg_token_mask[i, col_idx] = 0
                     col_idx += 1
                     
             if col_idx != per_batch_mask_length:
-                print('{} != {}'.format(col_idx, per_batch_mask_length))
+                # This should not happen with image-token-based expansion,
+                # but keep as a safety net for unexpected prompt structures.
+                print('[GLUS.evaluate] mask expansion mismatch: {} != {}'.format(
+                    col_idx, per_batch_mask_length))
+                return output_ids, None, None
+
+            # In decode_iter mode the LLM must produce [SEG] for the current
+            # frame.  If num_add_mask < question_frame_num the generated token
+            # was not [SEG] (e.g. EOS due to max_length truncation).  Fall back
+            # gracefully - the caller (inference_iter) fills a blank mask.
+            if decode_iter and num_add_mask < question_frame_num:
+                print(
+                    '[GLUS.evaluate] LLM did not generate [SEG] for current '
+                    'frame (found {} SEG tokens, expected {}).'.format(
+                        num_add_mask, question_frame_num))
                 return output_ids, None, None
                 
             seg_token_mask = _seg_token_mask
